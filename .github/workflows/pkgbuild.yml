@@ -153,7 +153,7 @@ jobs:
           NEEDED='${{ needs.get-versions.outputs[matrix.build_var] }}'
           echo "needed=${NEEDED}" >> "$GITHUB_OUTPUT"
           if [[ "$NEEDED" != "true" ]]; then
-            echo "Skipping ${{ matrix.name }} — already up to date."
+            echo "Skipping ${{ matrix.name }} - already up to date."
           fi
 
       - uses: actions/checkout@v4
@@ -516,6 +516,35 @@ jobs:
               ls -lh
             '
 
+      - name: Capture built package versions from staging
+        run: |
+          set -euo pipefail
+          # Read the canonical 'pkgver' from .PKGINFO inside each main package
+          # in /staging/ via pacman -Qp. This gives us the version users will see
+          # in `pacman -Q <pkg>` output, including the literal ':' epoch separator
+          # we stripped from the filename.
+          docker run --rm \
+            -v "$PWD/staging:/staging" \
+            "${DOCKER_IMAGE}" \
+            bash -c '
+              shopt -s nullglob
+              for p in virglrenderer; do
+                for f in /staging/${p}-*-x86_64.pkg.tar.zst; do
+                  out=$(pacman -Qp "$f" 2>/dev/null) || continue
+                  if [[ "${out%% *}" == "$p" ]]; then
+                    echo "$out"
+                    break
+                  fi
+                done
+              done
+            ' > versions.txt
+          cat versions.txt
+          while read -r pkg ver; do
+            [[ -z "$pkg" ]] && continue
+            KEY=$(echo "$pkg" | tr 'a-z-' 'A-Z_')_VER
+            echo "${KEY}=${ver}" >> "$GITHUB_ENV"
+          done < versions.txt
+
       - name: Replace latest-host release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -539,14 +568,16 @@ jobs:
 
           ## Contents
 
-          - \`virglrenderer\` from Arch \`${VTAG}\` + [virglrenderer-xe-native-context.patch](https://github.com/cmspam/xe-native-context-enablement/blob/master/virglrenderer-xe-native-context.patch) + meson \`-Ddrm-renderers=xe-experimental\`
+          - \`virglrenderer\` \`${VIRGLRENDERER_VER}\` (tracking Arch packaging tag \`${VTAG}\`)
+              + patch: [virglrenderer-xe-native-context.patch](https://github.com/cmspam/xe-native-context-enablement/blob/master/virglrenderer-xe-native-context.patch)
+              + meson: \`-Ddrm-renderers=xe-experimental\`
 
           Built in \`${DOCKER_IMAGE}\` (x86-64-v3).
           EOF
           )
 
           gh release create latest-host \
-            --title "xe-virt host repo (v3) — virglrenderer ${VTAG}" \
+            --title "xe-virt host repo (v3) - virglrenderer ${VIRGLRENDERER_VER}" \
             --notes "$NOTES" \
             staging/*.pkg.tar.zst \
             staging/${REPO_NAME_HOST}.db.tar.gz \
@@ -625,6 +656,31 @@ jobs:
               ls -lh
             '
 
+      - name: Capture built package versions from staging
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/staging:/staging" \
+            "${DOCKER_IMAGE}" \
+            bash -c '
+              shopt -s nullglob
+              for p in mesa lib32-mesa intel-media-driver; do
+                for f in /staging/${p}-*-x86_64.pkg.tar.zst; do
+                  out=$(pacman -Qp "$f" 2>/dev/null) || continue
+                  if [[ "${out%% *}" == "$p" ]]; then
+                    echo "$out"
+                    break
+                  fi
+                done
+              done
+            ' > versions.txt
+          cat versions.txt
+          while read -r pkg ver; do
+            [[ -z "$pkg" ]] && continue
+            KEY=$(echo "$pkg" | tr 'a-z-' 'A-Z_')_VER
+            echo "${KEY}=${ver}" >> "$GITHUB_ENV"
+          done < versions.txt
+
       - name: Replace latest-guest release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -632,7 +688,7 @@ jobs:
           set -euo pipefail
           MTAG='${{ needs.get-versions.outputs.mesa_tag }}'
           LMTAG='${{ needs.get-versions.outputs.lib32_mesa_tag }}'
-          IMD='${{ needs.get-versions.outputs.intel_media_driver_tag }}'
+          IMD_TAG='${{ needs.get-versions.outputs.intel_media_driver_tag }}'
           gh release delete latest-guest --yes --cleanup-tag 2>/dev/null || true
 
           NOTES=$(cat <<EOF
@@ -650,16 +706,20 @@ jobs:
 
           ## Contents
 
-          - \`mesa\` (and split subpackages like \`vulkan-intel\`) from Arch \`${MTAG}\` + [mesa-01-xe-native-context-plus-iris-upload-fix.patch](https://github.com/cmspam/xe-native-context-enablement/blob/master/mesa-01-xe-native-context-plus-iris-upload-fix.patch) + meson \`-D intel-virtio-experimental=true\`
-          - \`lib32-mesa\` (and split subpackages) from Arch \`${LMTAG}\` + same patch
-          - \`intel-media-driver\` from Arch \`${IMD}\` + [intel-media-driver-xe-native-context.patch](https://github.com/cmspam/xe-native-context-enablement/blob/master/intel-media-driver-xe-native-context.patch)
+          - \`mesa\` \`${MESA_VER}\` (tracking Arch packaging tag \`${MTAG}\`) plus split subpackages (\`vulkan-intel\`, \`opencl-clover-mesa\`, etc.)
+              + patch: [mesa-01-xe-native-context-plus-iris-upload-fix.patch](https://github.com/cmspam/xe-native-context-enablement/blob/master/mesa-01-xe-native-context-plus-iris-upload-fix.patch)
+              + meson: \`-D intel-virtio-experimental=true\`
+          - \`lib32-mesa\` \`${LIB32_MESA_VER}\` (tracking Arch packaging tag \`${LMTAG}\`) plus 32-bit split subpackages
+              + same patch and meson flag as \`mesa\`
+          - \`intel-media-driver\` \`${INTEL_MEDIA_DRIVER_VER}\` (tracking Arch packaging tag \`${IMD_TAG}\`)
+              + patch: [intel-media-driver-xe-native-context.patch](https://github.com/cmspam/xe-native-context-enablement/blob/master/intel-media-driver-xe-native-context.patch)
 
           Built in \`${DOCKER_IMAGE}\` (x86-64-v3).
           EOF
           )
 
           gh release create latest-guest \
-            --title "xe-virt guest repo (v3) — mesa ${MTAG}" \
+            --title "xe-virt guest repo (v3) - mesa ${MESA_VER}" \
             --notes "$NOTES" \
             staging/*.pkg.tar.zst \
             staging/${REPO_NAME_GUEST}.db.tar.gz \
