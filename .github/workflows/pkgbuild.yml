@@ -427,23 +427,30 @@ jobs:
           echo "=== Built packages ==="
           ls -lh build/*.pkg.tar.zst
 
-      - name: Bundle packages into tarball
+      - name: Rewrite ':' (epoch separator) to '-' in package filenames
         if: steps.gate.outputs.needed == 'true'
         run: |
           set -euo pipefail
-          # actions/upload-artifact rejects ':' in paths (Windows-path semantics).
-          # mesa et al. have epoch=1, so makepkg emits 'pkg-1:ver-rel-arch.pkg.tar.zst'.
-          # Tar everything up so the colons survive inside the archive.
+          # makepkg emits 'pkg-EPOCH:VER-REL-ARCH.pkg.tar.zst' for packages with
+          # epoch>0 (mesa, lib32-mesa). Both actions/upload-artifact AND GitHub
+          # Release asset uploads reject ':' in filenames, so normalize once here.
+          # The colon in the package's actual version is recorded inside .PKGINFO,
+          # so pacman's vercmp / -Q output / dependency resolution are unaffected;
+          # only %FILENAME% in the repo db changes.
           cd build
-          tar -cf pkgs.tar *.pkg.tar.zst
-          ls -lh pkgs.tar
+          shopt -s nullglob
+          for f in *:*.pkg.tar.zst; do
+            mv -v "$f" "${f//:/-}"
+          done
+          echo "=== Final package filenames ==="
+          ls -1 *.pkg.tar.zst
 
       - name: Upload package artifacts
         if: steps.gate.outputs.needed == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: pkgs-${{ matrix.name }}
-          path: build/pkgs.tar
+          path: build/*.pkg.tar.zst
           if-no-files-found: error
           retention-days: 7
 
@@ -463,17 +470,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: pkgs-virglrenderer
-          path: fresh-tars
+          path: fresh
           merge-multiple: true
-
-      - name: Extract package tarballs
-        run: |
-          set -euo pipefail
-          mkdir -p fresh
-          for t in fresh-tars/*.tar; do
-            [[ -f "$t" ]] && tar -xf "$t" -C fresh/
-          done
-          ls -1 fresh/
 
       - name: Stage existing release packages (if any)
         env:
@@ -572,16 +570,17 @@ jobs:
           path: fresh-all
           merge-multiple: false
 
-      - name: Extract guest-bucket package tarballs
+      - name: Collect guest-bucket package files
         run: |
           set -euo pipefail
           mkdir -p fresh
-          # Each artifact is a subdir like fresh-all/pkgs-mesa/pkgs.tar.
-          # Only host bucket has virglrenderer; everything else (mesa, lib32-mesa,
-          # intel-media-driver) belongs to the guest bucket.
+          # Only the guest bucket: mesa, lib32-mesa, intel-media-driver.
+          # virglrenderer goes to publish-host instead.
           for name in mesa lib32-mesa intel-media-driver; do
-            t="fresh-all/pkgs-${name}/pkgs.tar"
-            [[ -f "$t" ]] && tar -xf "$t" -C fresh/
+            d="fresh-all/pkgs-${name}"
+            if [[ -d "$d" ]]; then
+              cp -v "$d"/*.pkg.tar.zst fresh/
+            fi
           done
           echo "Fresh guest pkgs:"
           ls -1 fresh/ || echo "(none)"
