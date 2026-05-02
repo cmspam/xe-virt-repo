@@ -118,7 +118,7 @@ jobs:
             src_dir: 'mesa-$_pkgver'
             inject_method: meson_array
             extra_meson: '-D intel-virtio-experimental=true'
-            min_version: ''
+            min_version: '26.1.0rc3'
             vaapi_default: ''
             bucket: guest
             build_var: build_mesa
@@ -129,7 +129,7 @@ jobs:
             src_dir: 'mesa-$_pkgver'
             inject_method: meson_array
             extra_meson: '-D intel-virtio-experimental=true'
-            min_version: ''
+            min_version: '26.1.0rc3'
             vaapi_default: ''
             bucket: guest
             build_var: build_lib32_mesa
@@ -214,12 +214,13 @@ jobs:
               content = f.read()
 
           def vtuple(s):
-              # Best-effort numeric tuple for simple X.Y.Z versions; falls back to (s,) on weird input.
-              parts = s.split('.')
-              try:
-                  return tuple(int(p) for p in parts)
-              except ValueError:
-                  return (s,)
+              # Compare on the leading numeric.dotted prefix only, ignoring any
+              # alpha/rc/dev suffix. So '26.1.0rc3' and '26.1.0' both map to (26,1,0),
+              # which means "Arch shipping 26.1.0 final" satisfies a 26.1.0rc3 floor.
+              m = re.match(r'^([\d.]+)', s)
+              if not m:
+                  return (0,)
+              return tuple(int(p) for p in m.group(1).rstrip('.').split('.') if p)
 
           # 0. Optional pkgver floor (override Arch's pkgver if it's older than min_version).
           #    Used for virglrenderer where the patch needs >= 1.3.0 but Arch is on 1.2.0.
