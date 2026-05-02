@@ -1,4 +1,0 @@
-intel-media-driver=26.1.5-1
-lib32-mesa=1-26.0.6-1
-mesa=1-26.0.6-1
-virglrenderer=1.2.0-1
