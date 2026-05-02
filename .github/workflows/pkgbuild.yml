@@ -347,22 +347,21 @@ jobs:
 
           # 5. Optional VA-API default: drop /etc/profile.d + /usr/lib/environment.d
           #    files that set LIBVA_DRIVER_NAME=iHD (only if user hasn't already).
-          #    Use heredoc bodies so we don't have to fight Python+printf escape layering.
           if os.environ.get('VAAPI_DEFAULT', '').strip() == 'true':
-              snippet = '''
-  # xe-virt-repo: default LIBVA_DRIVER_NAME=iHD for guest VA-API
-  install -dm755 "$pkgdir/etc/profile.d" "$pkgdir/usr/lib/environment.d"
-  cat > "$pkgdir/etc/profile.d/xe-virt-vaapi.sh" <<'_XEVIRT_PROFILE_EOF'
-# Set Intel iHD as default VA-API driver (does not override an existing user setting)
-[ -z "${LIBVA_DRIVER_NAME-}" ] && export LIBVA_DRIVER_NAME=iHD
-_XEVIRT_PROFILE_EOF
-  chmod 644 "$pkgdir/etc/profile.d/xe-virt-vaapi.sh"
-  cat > "$pkgdir/usr/lib/environment.d/90-xe-virt-vaapi.conf" <<'_XEVIRT_ENVD_EOF'
-# Set Intel iHD as default VA-API driver. User can override via ~/.config/environment.d/.
-LIBVA_DRIVER_NAME=iHD
-_XEVIRT_ENVD_EOF
-  chmod 644 "$pkgdir/usr/lib/environment.d/90-xe-virt-vaapi.conf"
-'''
+              snippet = (
+                  "\n  # xe-virt-repo: default LIBVA_DRIVER_NAME=iHD for guest VA-API"
+                  "\n  install -dm755 \"$pkgdir/etc/profile.d\" \"$pkgdir/usr/lib/environment.d\""
+                  "\n  printf '%s\\n%s\\n' "
+                  "'# Set Intel iHD as default VA-API driver (does not override an existing user setting)' "
+                  "'[ -z \"${LIBVA_DRIVER_NAME-}\" ] && export LIBVA_DRIVER_NAME=iHD' "
+                  "> \"$pkgdir/etc/profile.d/xe-virt-vaapi.sh\""
+                  "\n  chmod 644 \"$pkgdir/etc/profile.d/xe-virt-vaapi.sh\""
+                  "\n  printf '%s\\n%s\\n' "
+                  "'# Set Intel iHD as default VA-API driver. User can override via ~/.config/environment.d/.' "
+                  "'LIBVA_DRIVER_NAME=iHD' "
+                  "> \"$pkgdir/usr/lib/environment.d/90-xe-virt-vaapi.conf\""
+                  "\n  chmod 644 \"$pkgdir/usr/lib/environment.d/90-xe-virt-vaapi.conf\"\n"
+              )
               m = re.search(r'\npackage\(\)\s*\{', content)
               if not m:
                   print('FATAL: package() not found, cannot inject VA-API defaults'); sys.exit(1)
