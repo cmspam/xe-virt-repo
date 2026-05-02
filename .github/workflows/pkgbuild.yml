@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
           for pkg in virglrenderer mesa lib32-mesa intel-media-driver; do
             ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$pkg")
-            TAG=$(curl -sf "${ARCH_API}%2F${ENC}/repository/tags?order_by=version&sort=desc&per_page=1" \
+            TAG=$(curl -sf "${ARCH_API}%2F${ENC}/repository/tags?order_by=updated&sort=desc&per_page=1" \
               | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['name']) if d else sys.exit(1)")
             VAR=$(echo "$pkg" | tr '-' '_')_tag
             echo "${VAR}=${TAG}" >> "$GITHUB_OUTPUT"
@@ -107,6 +107,7 @@ jobs:
             src_dir: 'virglrenderer-$_tag'
             inject_method: meson_line
             extra_meson: '-Ddrm-renderers=xe-experimental'
+            min_version: '1.3.0'
             bucket: host
             build_var: build_virglrenderer
             tag_var:   virglrenderer_tag
@@ -116,6 +117,7 @@ jobs:
             src_dir: 'mesa-$_pkgver'
             inject_method: meson_array
             extra_meson: '-D intel-virtio-experimental=true'
+            min_version: ''
             bucket: guest
             build_var: build_mesa
             tag_var:   mesa_tag
@@ -125,6 +127,7 @@ jobs:
             src_dir: 'mesa-$_pkgver'
             inject_method: meson_array
             extra_meson: '-D intel-virtio-experimental=true'
+            min_version: ''
             bucket: guest
             build_var: build_lib32_mesa
             tag_var:   lib32_mesa_tag
@@ -134,6 +137,7 @@ jobs:
             src_dir: 'media-driver-intel-media-${pkgver}'
             inject_method: none
             extra_meson: ''
+            min_version: ''
             bucket: guest
             build_var: build_intel_media_driver
             tag_var:   intel_media_driver_tag
@@ -189,6 +193,7 @@ jobs:
           SRC_DIR:       ${{ matrix.src_dir }}
           INJECT_METHOD: ${{ matrix.inject_method }}
           EXTRA_MESON:   ${{ matrix.extra_meson }}
+          MIN_VERSION:   ${{ matrix.min_version }}
         run: |
           set -euo pipefail
           cat > /tmp/inject.py << 'PYEOF'
@@ -198,9 +203,40 @@ jobs:
           src_dir       = os.environ['SRC_DIR']
           inject_method = os.environ['INJECT_METHOD']
           extra_meson   = os.environ['EXTRA_MESON']
+          min_version   = os.environ.get('MIN_VERSION', '').strip()
 
           with open('PKGBUILD', 'r') as f:
               content = f.read()
+
+          def vtuple(s):
+              # Best-effort numeric tuple for simple X.Y.Z versions; falls back to (s,) on weird input.
+              parts = s.split('.')
+              try:
+                  return tuple(int(p) for p in parts)
+              except ValueError:
+                  return (s,)
+
+          # 0. Optional pkgver floor (override Arch's pkgver if it's older than min_version).
+          #    Used for virglrenderer where the patch needs >= 1.3.0 but Arch is on 1.2.0.
+          if min_version:
+              m = re.search(r'^pkgver=([^\s\n]+)', content, re.MULTILINE)
+              if not m:
+                  print('FATAL: pkgver= not found, cannot apply min_version'); sys.exit(1)
+              cur_ver = m.group(1)
+              if vtuple(cur_ver) < vtuple(min_version):
+                  print(f'pkgver floor: rewriting {cur_ver} -> {min_version}')
+                  content = re.sub(r'^pkgver=[^\s\n]+', f'pkgver={min_version}', content, count=1, flags=re.MULTILINE)
+                  # Reset pkgrel to 1 (Arch convention when bumping pkgver).
+                  content = re.sub(r'^pkgrel=[^\s\n]+', 'pkgrel=1', content, count=1, flags=re.MULTILINE)
+                  # Force-SKIP every existing checksum array entry, since the tarball changed.
+                  for arr in ('sha256sums', 'sha512sums', 'b2sums', 'sha1sums', 'md5sums'):
+                      def _skip_all(match):
+                          inner = match.group(1)
+                          # Replace each quoted hex string with 'SKIP'
+                          return match.group(0).replace(inner, re.sub(r"'[^']+'", "'SKIP'", inner))
+                      content = re.sub(rf'(?s)\b{arr}=\(([^)]*)\)', _skip_all, content, count=1)
+              else:
+                  print(f'pkgver floor: Arch {cur_ver} >= {min_version}, no override')
 
           def insert_before_closing_paren(content, array_name, value):
               """Find `array_name=(` (optionally preceded by 'local ') and insert value before its closing paren."""
@@ -294,8 +330,8 @@ jobs:
           PYEOF
           cd build && python3 /tmp/inject.py
           echo ""
-          echo "=== Verification (patch + prepare + meson) ==="
-          grep -nE "${PATCH_FILE}|^prepare\(\)|^build\(\)|meson_options=|arch-meson|^[[:space:]]*meson " PKGBUILD | head -30 || true
+          echo "=== Verification (pkgver + patch + prepare + meson) ==="
+          grep -nE "^pkgver=|^pkgrel=|${PATCH_FILE}|^prepare\(\)|^build\(\)|meson_options=|arch-meson|^[[:space:]]*meson " PKGBUILD | head -30 || true
 
       - name: Build package in cachyos-v3 docker
         if: steps.gate.outputs.needed == 'true'
