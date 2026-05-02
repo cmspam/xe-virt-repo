@@ -108,6 +108,7 @@ jobs:
             inject_method: meson_line
             extra_meson: '-Ddrm-renderers=xe-experimental'
             min_version: '1.3.0'
+            vaapi_default: ''
             bucket: host
             build_var: build_virglrenderer
             tag_var:   virglrenderer_tag
@@ -118,6 +119,7 @@ jobs:
             inject_method: meson_array
             extra_meson: '-D intel-virtio-experimental=true'
             min_version: ''
+            vaapi_default: ''
             bucket: guest
             build_var: build_mesa
             tag_var:   mesa_tag
@@ -128,6 +130,7 @@ jobs:
             inject_method: meson_array
             extra_meson: '-D intel-virtio-experimental=true'
             min_version: ''
+            vaapi_default: ''
             bucket: guest
             build_var: build_lib32_mesa
             tag_var:   lib32_mesa_tag
@@ -138,6 +141,7 @@ jobs:
             inject_method: none
             extra_meson: ''
             min_version: ''
+            vaapi_default: 'true'
             bucket: guest
             build_var: build_intel_media_driver
             tag_var:   intel_media_driver_tag
@@ -194,6 +198,7 @@ jobs:
           INJECT_METHOD: ${{ matrix.inject_method }}
           EXTRA_MESON:   ${{ matrix.extra_meson }}
           MIN_VERSION:   ${{ matrix.min_version }}
+          VAAPI_DEFAULT: ${{ matrix.vaapi_default }}
         run: |
           set -euo pipefail
           cat > /tmp/inject.py << 'PYEOF'
@@ -268,20 +273,36 @@ jobs:
               print(f'WARNING: no closing paren found for {array_name}')
               return content, False
 
-          # 1. Add patch to source=()
-          content, ok = insert_before_closing_paren(content, 'source', patch_file)
-          if not ok:
-              print('FATAL: source array not found'); sys.exit(1)
-
-          # 2. Add 'SKIP' to whichever checksum arrays exist
-          sum_added = 0
+          # 1+2. Append patch to source array via `source+=(...)` and `sha256sums+=('SKIP')`,
+          #      placed AFTER any dynamic source manipulation (mesa appends rust crates in a
+          #      for-loop) and just before the first build function. This guarantees the
+          #      patch's index in `source` matches the SKIP's index in each sums array,
+          #      regardless of how the static arrays were constructed.
+          existing_sums = []
           for arr in ('sha256sums', 'sha512sums', 'b2sums', 'sha1sums', 'md5sums'):
-              content, ok = insert_before_closing_paren(content, arr, "'SKIP'")
-              if ok:
-                  sum_added += 1
-          if sum_added == 0:
-              print('FATAL: no checksum arrays found'); sys.exit(1)
-          print(f'Injected SKIP into {sum_added} sum array(s)')
+              if re.search(rf'(?m)^\s*(local\s+)?{arr}=\(', content):
+                  existing_sums.append(arr)
+          if not existing_sums:
+              print('FATAL: no checksum arrays found in PKGBUILD'); sys.exit(1)
+
+          append_lines = [
+              '',
+              '# xe-virt-repo: append patch to source array (after any dynamic appends)',
+              f'source+=("{patch_file}")',
+          ]
+          for arr in existing_sums:
+              append_lines.append(f"{arr}+=('SKIP')")
+          append_lines.append('')
+          append_block = '\n'.join(append_lines)
+
+          # Insert before the first build-stage function, or append at EOF if none.
+          m_build = re.search(r'\n(prepare|build|check|package)(_[A-Za-z0-9_+.-]+)?\(\)\s*\{', content)
+          if m_build:
+              content = content[:m_build.start()] + append_block + content[m_build.start():]
+              print(f'Appended source/sums for patch before {m_build.group(1)}() ({", ".join(existing_sums)})')
+          else:
+              content = content.rstrip() + '\n' + append_block + '\n'
+              print(f'Appended source/sums for patch at EOF ({", ".join(existing_sums)})')
 
           # 3. Add patch command to prepare(). Use bash variable expansion in src_dir.
           patch_cmd = f'  patch -Np1 -d "{src_dir}" -i "../{patch_file}"'
@@ -323,6 +344,30 @@ jobs:
 
           else:
               print(f'FATAL: unknown inject_method {inject_method}'); sys.exit(1)
+
+          # 5. Optional VA-API default: drop /etc/profile.d + /usr/lib/environment.d
+          #    files that set LIBVA_DRIVER_NAME=iHD (only if user hasn't already).
+          #    Use heredoc bodies so we don't have to fight Python+printf escape layering.
+          if os.environ.get('VAAPI_DEFAULT', '').strip() == 'true':
+              snippet = '''
+  # xe-virt-repo: default LIBVA_DRIVER_NAME=iHD for guest VA-API
+  install -dm755 "$pkgdir/etc/profile.d" "$pkgdir/usr/lib/environment.d"
+  cat > "$pkgdir/etc/profile.d/xe-virt-vaapi.sh" <<'_XEVIRT_PROFILE_EOF'
+# Set Intel iHD as default VA-API driver (does not override an existing user setting)
+[ -z "${LIBVA_DRIVER_NAME-}" ] && export LIBVA_DRIVER_NAME=iHD
+_XEVIRT_PROFILE_EOF
+  chmod 644 "$pkgdir/etc/profile.d/xe-virt-vaapi.sh"
+  cat > "$pkgdir/usr/lib/environment.d/90-xe-virt-vaapi.conf" <<'_XEVIRT_ENVD_EOF'
+# Set Intel iHD as default VA-API driver. User can override via ~/.config/environment.d/.
+LIBVA_DRIVER_NAME=iHD
+_XEVIRT_ENVD_EOF
+  chmod 644 "$pkgdir/usr/lib/environment.d/90-xe-virt-vaapi.conf"
+'''
+              m = re.search(r'\npackage\(\)\s*\{', content)
+              if not m:
+                  print('FATAL: package() not found, cannot inject VA-API defaults'); sys.exit(1)
+              content = content[:m.end()] + snippet + content[m.end():]
+              print('Injected VA-API default LIBVA_DRIVER_NAME=iHD config files into package()')
 
           with open('PKGBUILD', 'w') as f:
               f.write(content)

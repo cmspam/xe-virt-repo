@@ -48,13 +48,21 @@ You now have:
 - `mesa` / `lib32-mesa` with the `intel-virtio-experimental` Mesa feature enabled (powers iris OpenGL + ANV Vulkan over virtio)
 - `intel-media-driver` patched with the vdrm shim (powers VA-API hardware video over virtio)
 
+The `intel-media-driver` package also ships:
+- `/etc/profile.d/xe-virt-vaapi.sh` — sets `LIBVA_DRIVER_NAME=iHD` for shell sessions if you haven't set it yourself
+- `/usr/lib/environment.d/90-xe-virt-vaapi.conf` — same default for systemd-managed user sessions (graphical apps)
+
+Both yield to a user-set `LIBVA_DRIVER_NAME` (e.g. in your dotfiles or `~/.config/environment.d/`), and both are uninstalled cleanly with `pacman -R intel-media-driver`.
+
 That's it. Reboot the guest after install so Mesa changes take effect for every running app.
+
+**Caveat**: this repo targets modern Intel Xe hardware. The iHD VA-API driver doesn't support pre-Broadwell iGPUs — if you accidentally install `xe-virt-guest-v3` on a host with old Intel hardware that needs the i965 driver, override `LIBVA_DRIVER_NAME` in your shell config or remove the package.
 
 ---
 
 ## QEMU configuration (host)
 
-You need a recent QEMU. The minimum required options:
+The Arch/CachyOS stock `qemu` package is recent enough — no special build needed. The minimum required options:
 
 ```
 -accel kvm,honor-guest-pat=on
@@ -62,8 +70,6 @@ You need a recent QEMU. The minimum required options:
 ```
 
 `drm_native_context=on` is the key flag. Without it, you get software rendering or full virgl translation, not Xe passthrough.
-
-If your QEMU is too old to support these flags (`drm_native_context` and `honor-guest-pat`), use the patched build from [`cmspam/qemu-patched`](https://github.com/cmspam/qemu-patched).
 
 ---
 
@@ -113,7 +119,7 @@ GitHub Actions will email you on workflow failure. There is no silent staleness 
 ## Companion repositories
 
 - [**cmspam/xe-native-context-enablement**](https://github.com/cmspam/xe-native-context-enablement) — the upstream patches (this repo pulls them at build time).
-- [**cmspam/qemu-patched**](https://github.com/cmspam/qemu-patched) — patched QEMU build with `drm_native_context` and `honor-guest-pat` if your distro QEMU is too old.
+- [**cmspam/qemu-patched**](https://github.com/cmspam/qemu-patched) — patched QEMU build with extra refresh-rate / VAAPI / latency tweaks (optional companion).
 
 ---
 
