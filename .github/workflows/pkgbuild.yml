@@ -437,6 +437,10 @@ jobs:
           # The colon in the package's actual version is recorded inside .PKGINFO,
           # so pacman's vercmp / -Q output / dependency resolution are unaffected;
           # only %FILENAME% in the repo db changes.
+          #
+          # The docker step chowned build/ to the in-container builder UID; reclaim
+          # ownership so the runner can rename and the artifact uploader can read.
+          sudo chown -R "$(id -u):$(id -g)" build
           cd build
           shopt -s nullglob
           for f in *:*.pkg.tar.zst; do
