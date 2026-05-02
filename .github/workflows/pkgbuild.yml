@@ -1,0 +1,628 @@
+name: Build and Publish xe-virt packages
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # 06:00 UTC
+    - cron: '0 18 * * *'  # 18:00 UTC
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/pkgbuild.yml'
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  ARCH_API: https://gitlab.archlinux.org/api/v4/projects/archlinux%2Fpackaging%2Fpackages
+  PATCH_BASE: https://raw.githubusercontent.com/cmspam/xe-native-context-enablement/master
+  REPO_NAME_HOST: xe-virt-host-v3
+  REPO_NAME_GUEST: xe-virt-guest-v3
+  DOCKER_IMAGE: cachyos/cachyos-v3
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Decide what needs building by diffing Arch tags against last_built_versions.txt
+  # -------------------------------------------------------------------------
+  get-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      virglrenderer_tag:        ${{ steps.tags.outputs.virglrenderer_tag }}
+      mesa_tag:                  ${{ steps.tags.outputs.mesa_tag }}
+      lib32_mesa_tag:            ${{ steps.tags.outputs.lib32_mesa_tag }}
+      intel_media_driver_tag:    ${{ steps.tags.outputs.intel_media_driver_tag }}
+      build_virglrenderer:       ${{ steps.check.outputs.build_virglrenderer }}
+      build_mesa:                ${{ steps.check.outputs.build_mesa }}
+      build_lib32_mesa:          ${{ steps.check.outputs.build_lib32_mesa }}
+      build_intel_media_driver:  ${{ steps.check.outputs.build_intel_media_driver }}
+      anything_host:             ${{ steps.check.outputs.anything_host }}
+      anything_guest:            ${{ steps.check.outputs.anything_guest }}
+      anything:                  ${{ steps.check.outputs.anything }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get latest Arch tags
+        id: tags
+        run: |
+          set -euo pipefail
+          for pkg in virglrenderer mesa lib32-mesa intel-media-driver; do
+            ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$pkg")
+            TAG=$(curl -sf "${ARCH_API}/${ENC}/repository/tags?order_by=version&sort=desc&per_page=1" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['name']) if d else sys.exit(1)")
+            VAR=$(echo "$pkg" | tr '-' '_')_tag
+            echo "${VAR}=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "$pkg: $TAG"
+          done
+
+      - name: Diff against last_built_versions.txt
+        id: check
+        run: |
+          set -euo pipefail
+          touch last_built_versions.txt
+          ANY=false
+          ANY_HOST=false
+          ANY_GUEST=false
+          declare -A BUCKET=( [virglrenderer]=host [mesa]=guest [lib32-mesa]=guest [intel-media-driver]=guest )
+          declare -A LATEST=(
+            [virglrenderer]='${{ steps.tags.outputs.virglrenderer_tag }}'
+            [mesa]='${{ steps.tags.outputs.mesa_tag }}'
+            [lib32-mesa]='${{ steps.tags.outputs.lib32_mesa_tag }}'
+            [intel-media-driver]='${{ steps.tags.outputs.intel_media_driver_tag }}'
+          )
+          for pkg in virglrenderer mesa lib32-mesa intel-media-driver; do
+            LAST=$(grep -E "^${pkg}=" last_built_versions.txt | head -1 | cut -d= -f2- || true)
+            CUR="${LATEST[$pkg]}"
+            KEY=build_$(echo "$pkg" | tr '-' '_')
+            if [[ "$LAST" == "$CUR" && -n "$LAST" ]]; then
+              echo "${KEY}=false" >> "$GITHUB_OUTPUT"
+              echo "  $pkg: up-to-date ($CUR)"
+            else
+              echo "${KEY}=true" >> "$GITHUB_OUTPUT"
+              echo "  $pkg: NEEDS BUILD (last='$LAST', latest='$CUR')"
+              ANY=true
+              if [[ "${BUCKET[$pkg]}" == "host" ]]; then ANY_HOST=true; else ANY_GUEST=true; fi
+            fi
+          done
+          echo "anything=${ANY}"             >> "$GITHUB_OUTPUT"
+          echo "anything_host=${ANY_HOST}"   >> "$GITHUB_OUTPUT"
+          echo "anything_guest=${ANY_GUEST}" >> "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------------------
+  # 2. Build each package (matrix). Skips quickly if its needs_build is false.
+  # -------------------------------------------------------------------------
+  build:
+    needs: get-versions
+    if: needs.get-versions.outputs.anything == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: virglrenderer
+            arch_pkg: virglrenderer
+            patch_file: virglrenderer-xe-native-context.patch
+            src_dir: 'virglrenderer-$_tag'
+            inject_method: meson_line
+            extra_meson: '-Ddrm-renderers=xe-experimental'
+            bucket: host
+            build_var: build_virglrenderer
+            tag_var:   virglrenderer_tag
+          - name: mesa
+            arch_pkg: mesa
+            patch_file: mesa-01-xe-native-context-plus-iris-upload-fix.patch
+            src_dir: 'mesa-$_pkgver'
+            inject_method: meson_array
+            extra_meson: '-D intel-virtio-experimental=true'
+            bucket: guest
+            build_var: build_mesa
+            tag_var:   mesa_tag
+          - name: lib32-mesa
+            arch_pkg: lib32-mesa
+            patch_file: mesa-01-xe-native-context-plus-iris-upload-fix.patch
+            src_dir: 'mesa-$_pkgver'
+            inject_method: meson_array
+            extra_meson: '-D intel-virtio-experimental=true'
+            bucket: guest
+            build_var: build_lib32_mesa
+            tag_var:   lib32_mesa_tag
+          - name: intel-media-driver
+            arch_pkg: intel-media-driver
+            patch_file: intel-media-driver-xe-native-context.patch
+            src_dir: 'media-driver-intel-media-${pkgver}'
+            inject_method: none
+            extra_meson: ''
+            bucket: guest
+            build_var: build_intel_media_driver
+            tag_var:   intel_media_driver_tag
+
+    steps:
+      - name: Should we build this matrix entry?
+        id: gate
+        run: |
+          NEEDED='${{ needs.get-versions.outputs[matrix.build_var] }}'
+          echo "needed=${NEEDED}" >> "$GITHUB_OUTPUT"
+          if [[ "$NEEDED" != "true" ]]; then
+            echo "Skipping ${{ matrix.name }} — already up to date."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.needed == 'true'
+
+      - name: Download Arch ${{ matrix.arch_pkg }} PKGBUILD + sources
+        if: steps.gate.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+          TAG='${{ needs.get-versions.outputs[matrix.tag_var] }}'
+          ARCH_PKG='${{ matrix.arch_pkg }}'
+          ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$ARCH_PKG")
+          mkdir -p build
+          FILES=$(curl -sf "${ARCH_API}/${ENC}/repository/tree?ref=${TAG}&per_page=100" \
+            | python3 -c "
+          import sys, json
+          for f in json.load(sys.stdin):
+              if f['type'] == 'blob':
+                  print(f['name'])
+          ")
+          echo "Files in $ARCH_PKG $TAG:"
+          echo "$FILES"
+          for FILE in $FILES; do
+            FENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$FILE")
+            curl -sfL "${ARCH_API}/${ENC}/repository/files/${FENC}/raw?ref=${TAG}" -o "build/${FILE}"
+            echo "  downloaded: $FILE"
+          done
+
+      - name: Download patch from xe-native-context-enablement
+        if: steps.gate.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+          PATCH='${{ matrix.patch_file }}'
+          curl -sfL "${PATCH_BASE}/${PATCH}" -o "build/${PATCH}"
+          echo "Patch ${PATCH} downloaded ($(wc -c < build/${PATCH}) bytes)"
+
+      - name: Inject patch + meson flag into PKGBUILD
+        if: steps.gate.outputs.needed == 'true'
+        env:
+          PATCH_FILE:    ${{ matrix.patch_file }}
+          SRC_DIR:       ${{ matrix.src_dir }}
+          INJECT_METHOD: ${{ matrix.inject_method }}
+          EXTRA_MESON:   ${{ matrix.extra_meson }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/inject.py << 'PYEOF'
+          import os, re, sys
+
+          patch_file    = os.environ['PATCH_FILE']
+          src_dir       = os.environ['SRC_DIR']
+          inject_method = os.environ['INJECT_METHOD']
+          extra_meson   = os.environ['EXTRA_MESON']
+
+          with open('PKGBUILD', 'r') as f:
+              content = f.read()
+
+          def insert_before_closing_paren(content, array_name, value):
+              """Find `array_name=(` (optionally preceded by 'local ') and insert value before its closing paren."""
+              for needle in ('\n' + array_name + '=(', '\nlocal ' + array_name + '=(', array_name + '=('):
+                  start = content.find(needle)
+                  if start != -1:
+                      break
+              if start == -1:
+                  print(f'INFO: array {array_name} not found, skipping')
+                  return content, False
+              i = content.index('(', start)
+              depth = 0
+              in_squote = False
+              in_dquote = False
+              while i < len(content):
+                  c = content[i]
+                  if c == "'" and not in_dquote:
+                      in_squote = not in_squote
+                  elif c == '"' and not in_squote:
+                      in_dquote = not in_dquote
+                  elif not in_squote and not in_dquote:
+                      if c == '(':
+                          depth += 1
+                      elif c == ')':
+                          depth -= 1
+                          if depth == 0:
+                              return content[:i] + '\n  ' + value + '\n' + content[i:], True
+                  i += 1
+              print(f'WARNING: no closing paren found for {array_name}')
+              return content, False
+
+          # 1. Add patch to source=()
+          content, ok = insert_before_closing_paren(content, 'source', patch_file)
+          if not ok:
+              print('FATAL: source array not found'); sys.exit(1)
+
+          # 2. Add 'SKIP' to whichever checksum arrays exist
+          sum_added = 0
+          for arr in ('sha256sums', 'sha512sums', 'b2sums', 'sha1sums', 'md5sums'):
+              content, ok = insert_before_closing_paren(content, arr, "'SKIP'")
+              if ok:
+                  sum_added += 1
+          if sum_added == 0:
+              print('FATAL: no checksum arrays found'); sys.exit(1)
+          print(f'Injected SKIP into {sum_added} sum array(s)')
+
+          # 3. Add patch command to prepare(). Use bash variable expansion in src_dir.
+          patch_cmd = f'  patch -Np1 -d "{src_dir}" -i "../{patch_file}"'
+          if '\nprepare() {' in content:
+              content = content.replace('\nprepare() {', '\nprepare() {\n' + patch_cmd, 1)
+              print('Inserted patch into existing prepare()')
+          else:
+              content = content.replace('\nbuild() {', '\nprepare() {\n' + patch_cmd + '\n}\n\nbuild() {', 1)
+              print('Created new prepare() with patch command')
+
+          # 4. Inject extra meson flag
+          if inject_method == 'meson_array':
+              # Append to meson_options=() array (single token, no quotes; bash splits on space)
+              # Use multiple lines for multi-token flags like '-D intel-virtio-experimental=true'
+              tokens = extra_meson.split()
+              for tok in tokens:
+                  content, ok = insert_before_closing_paren(content, 'meson_options', tok)
+                  if not ok:
+                      print(f'FATAL: meson_options array not found for {tok}'); sys.exit(1)
+              print(f'Injected {len(tokens)} token(s) into meson_options')
+
+          elif inject_method == 'meson_line':
+              # Insert flag right after the meson|arch-meson invocation token in build()
+              # Negative lookahead skips meson compile/install/test
+              new_content, n = re.subn(
+                  r'^(\s*(?:arch-meson|meson(?!\s+(?:compile|install|test|introspect|configure|wrap|subprojects|init|format|env2mfile))))\b',
+                  lambda m: m.group(1) + ' ' + extra_meson,
+                  content,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+              if n == 0:
+                  print('FATAL: no meson invocation found for line-inject'); sys.exit(1)
+              content = new_content
+              print(f'Injected meson flag: {extra_meson}')
+
+          elif inject_method == 'none':
+              print('No extra meson flag injection requested')
+
+          else:
+              print(f'FATAL: unknown inject_method {inject_method}'); sys.exit(1)
+
+          with open('PKGBUILD', 'w') as f:
+              f.write(content)
+          print('PKGBUILD injection complete.')
+          PYEOF
+          cd build && python3 /tmp/inject.py
+          echo ""
+          echo "=== Verification (patch + prepare + meson) ==="
+          grep -nE "${PATCH_FILE}|^prepare\(\)|^build\(\)|meson_options=|arch-meson|^[[:space:]]*meson " PKGBUILD | head -30 || true
+
+      - name: Build package in cachyos-v3 docker
+        if: steps.gate.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --privileged \
+            -v "$PWD/build:/pkg" \
+            "${DOCKER_IMAGE}" \
+            bash -c '
+              set -e
+              echo "=== Ensure multilib (for lib32-mesa) ==="
+              if ! grep -q "^\[multilib\]" /etc/pacman.conf; then
+                printf "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n" >> /etc/pacman.conf
+                echo "Multilib enabled."
+              fi
+
+              echo "=== System update ==="
+              pacman -Syu --noconfirm
+
+              echo "=== Build dependencies ==="
+              pacman -S --noconfirm --needed base-devel sudo
+
+              echo "=== Build user ==="
+              useradd -m builder || true
+              echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+              chown -R builder:builder /pkg
+
+              echo "=== makepkg ==="
+              cd /pkg
+              # --skipinteg because we set SKIP for the patch we vendored in.
+              # makepkg refuses to run as root, so use builder.
+              sudo -u builder makepkg -sf --noconfirm --skippgpcheck
+            '
+          echo ""
+          echo "=== Built packages ==="
+          ls -lh build/*.pkg.tar.zst
+
+      - name: Upload package artifacts
+        if: steps.gate.outputs.needed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkgs-${{ matrix.name }}
+          path: build/*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # 3a. Publish HOST repo (virglrenderer)
+  # -------------------------------------------------------------------------
+  publish-host:
+    needs: [get-versions, build]
+    if: needs.get-versions.outputs.anything_host == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download freshly-built host artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkgs-virglrenderer
+          path: fresh
+          merge-multiple: true
+
+      - name: Stage existing release packages (if any)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          gh release download latest-host -D staging --pattern '*.pkg.tar.zst' 2>/dev/null \
+            || echo "No existing latest-host release; starting fresh."
+          echo "Existing pkgs in staging:"
+          ls -1 staging/ 2>/dev/null || true
+
+      - name: Merge fresh over existing, run repo-add
+        run: |
+          set -euo pipefail
+          # Use cachyos image so we have repo-add and pacman -Qp
+          docker run --rm \
+            -v "$PWD/fresh:/fresh" \
+            -v "$PWD/staging:/staging" \
+            -e REPO="${REPO_NAME_HOST}" \
+            "${DOCKER_IMAGE}" \
+            bash -c '
+              set -e
+              # For each freshly-built pkg, drop any older version of the same pkgname from staging
+              for f in /fresh/*.pkg.tar.zst; do
+                PKGNAME=$(pacman -Qp "$f" 2>/dev/null | awk "{print \$1}")
+                echo "Replacing pkgname=$PKGNAME"
+                rm -f /staging/${PKGNAME}-*.pkg.tar.zst
+              done
+              cp /fresh/*.pkg.tar.zst /staging/
+              # Rebuild db from scratch so it reflects exactly /staging
+              rm -f /staging/${REPO}.db* /staging/${REPO}.files*
+              cd /staging
+              repo-add ${REPO}.db.tar.gz *.pkg.tar.zst
+              ln -sf ${REPO}.db.tar.gz ${REPO}.db
+              ln -sf ${REPO}.files.tar.gz ${REPO}.files
+              echo "=== Final staging contents ==="
+              ls -lh
+            '
+
+      - name: Replace latest-host release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VTAG='${{ needs.get-versions.outputs.virglrenderer_tag }}'
+          gh release delete latest-host --yes --cleanup-tag 2>/dev/null || true
+
+          NOTES=$(cat <<EOF
+          Pacman repository for **host-side** Intel Xe native-context packages, built x86-64-v3.
+
+          ## pacman.conf
+
+          \`\`\`ini
+          [${REPO_NAME_HOST}]
+          SigLevel = Optional
+          Server = https://github.com/cmspam/xe-virt-repo/releases/download/latest-host
+          \`\`\`
+
+          Then \`sudo pacman -Syu virglrenderer\`.
+
+          ## Contents
+
+          - \`virglrenderer\` from Arch \`${VTAG}\` + [virglrenderer-xe-native-context.patch](https://github.com/cmspam/xe-native-context-enablement/blob/master/virglrenderer-xe-native-context.patch) + meson \`-Ddrm-renderers=xe-experimental\`
+
+          Built in \`${DOCKER_IMAGE}\` (x86-64-v3).
+          EOF
+          )
+
+          gh release create latest-host \
+            --title "xe-virt host repo (v3) — virglrenderer ${VTAG}" \
+            --notes "$NOTES" \
+            staging/*.pkg.tar.zst \
+            staging/${REPO_NAME_HOST}.db.tar.gz \
+            staging/${REPO_NAME_HOST}.db \
+            staging/${REPO_NAME_HOST}.files.tar.gz \
+            staging/${REPO_NAME_HOST}.files
+          echo "latest-host release published."
+
+  # -------------------------------------------------------------------------
+  # 3b. Publish GUEST repo (mesa, lib32-mesa, intel-media-driver)
+  # -------------------------------------------------------------------------
+  publish-guest:
+    needs: [get-versions, build]
+    if: needs.get-versions.outputs.anything_guest == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download freshly-built guest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkgs-*
+          path: fresh-all
+          merge-multiple: false
+
+      - name: Collect guest-bucket artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p fresh
+          # Each artifact is a subdir like fresh-all/pkgs-mesa/*.pkg.tar.zst
+          for d in fresh-all/pkgs-mesa fresh-all/pkgs-lib32-mesa fresh-all/pkgs-intel-media-driver; do
+            if [[ -d "$d" ]]; then
+              cp -v "$d"/*.pkg.tar.zst fresh/ || true
+            fi
+          done
+          echo "Fresh guest pkgs:"
+          ls -1 fresh/ || echo "(none)"
+
+      - name: Stage existing release packages (if any)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          gh release download latest-guest -D staging --pattern '*.pkg.tar.zst' 2>/dev/null \
+            || echo "No existing latest-guest release; starting fresh."
+          echo "Existing pkgs in staging: $(ls staging/ 2>/dev/null | wc -l) files"
+
+      - name: Merge fresh over existing, run repo-add
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/fresh:/fresh" \
+            -v "$PWD/staging:/staging" \
+            -e REPO="${REPO_NAME_GUEST}" \
+            "${DOCKER_IMAGE}" \
+            bash -c '
+              set -e
+              shopt -s nullglob
+              for f in /fresh/*.pkg.tar.zst; do
+                PKGNAME=$(pacman -Qp "$f" 2>/dev/null | awk "{print \$1}")
+                echo "Replacing pkgname=$PKGNAME"
+                rm -f /staging/${PKGNAME}-*.pkg.tar.zst
+              done
+              cp /fresh/*.pkg.tar.zst /staging/ 2>/dev/null || true
+              rm -f /staging/${REPO}.db* /staging/${REPO}.files*
+              cd /staging
+              repo-add ${REPO}.db.tar.gz *.pkg.tar.zst
+              ln -sf ${REPO}.db.tar.gz ${REPO}.db
+              ln -sf ${REPO}.files.tar.gz ${REPO}.files
+              echo "=== Final staging contents ==="
+              ls -lh
+            '
+
+      - name: Replace latest-guest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          MTAG='${{ needs.get-versions.outputs.mesa_tag }}'
+          LMTAG='${{ needs.get-versions.outputs.lib32_mesa_tag }}'
+          IMD='${{ needs.get-versions.outputs.intel_media_driver_tag }}'
+          gh release delete latest-guest --yes --cleanup-tag 2>/dev/null || true
+
+          NOTES=$(cat <<EOF
+          Pacman repository for **guest-side** Intel Xe native-context packages, built x86-64-v3.
+
+          ## pacman.conf
+
+          \`\`\`ini
+          [${REPO_NAME_GUEST}]
+          SigLevel = Optional
+          Server = https://github.com/cmspam/xe-virt-repo/releases/download/latest-guest
+          \`\`\`
+
+          Then \`sudo pacman -Syu mesa lib32-mesa intel-media-driver\`.
+
+          ## Contents
+
+          - \`mesa\` (and split subpackages like \`vulkan-intel\`) from Arch \`${MTAG}\` + [mesa-01-xe-native-context-plus-iris-upload-fix.patch](https://github.com/cmspam/xe-native-context-enablement/blob/master/mesa-01-xe-native-context-plus-iris-upload-fix.patch) + meson \`-D intel-virtio-experimental=true\`
+          - \`lib32-mesa\` (and split subpackages) from Arch \`${LMTAG}\` + same patch
+          - \`intel-media-driver\` from Arch \`${IMD}\` + [intel-media-driver-xe-native-context.patch](https://github.com/cmspam/xe-native-context-enablement/blob/master/intel-media-driver-xe-native-context.patch)
+
+          Built in \`${DOCKER_IMAGE}\` (x86-64-v3).
+          EOF
+          )
+
+          gh release create latest-guest \
+            --title "xe-virt guest repo (v3) — mesa ${MTAG}" \
+            --notes "$NOTES" \
+            staging/*.pkg.tar.zst \
+            staging/${REPO_NAME_GUEST}.db.tar.gz \
+            staging/${REPO_NAME_GUEST}.db \
+            staging/${REPO_NAME_GUEST}.files.tar.gz \
+            staging/${REPO_NAME_GUEST}.files
+          echo "latest-guest release published."
+
+  # -------------------------------------------------------------------------
+  # 4. Record built versions back to the repo
+  # -------------------------------------------------------------------------
+  record-versions:
+    needs: [get-versions, build, publish-host, publish-guest]
+    if: |
+      always() &&
+      needs.get-versions.result == 'success' &&
+      needs.build.result == 'success' &&
+      (needs.publish-host.result == 'success' || needs.publish-host.result == 'skipped') &&
+      (needs.publish-guest.result == 'success' || needs.publish-guest.result == 'skipped') &&
+      needs.get-versions.outputs.anything == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update last_built_versions.txt
+        run: |
+          set -euo pipefail
+          declare -A LATEST=(
+            [virglrenderer]='${{ needs.get-versions.outputs.virglrenderer_tag }}'
+            [mesa]='${{ needs.get-versions.outputs.mesa_tag }}'
+            [lib32-mesa]='${{ needs.get-versions.outputs.lib32_mesa_tag }}'
+            [intel-media-driver]='${{ needs.get-versions.outputs.intel_media_driver_tag }}'
+          )
+          declare -A BUILT=(
+            [virglrenderer]='${{ needs.get-versions.outputs.build_virglrenderer }}'
+            [mesa]='${{ needs.get-versions.outputs.build_mesa }}'
+            [lib32-mesa]='${{ needs.get-versions.outputs.build_lib32_mesa }}'
+            [intel-media-driver]='${{ needs.get-versions.outputs.build_intel_media_driver }}'
+          )
+          touch last_built_versions.txt
+          for pkg in virglrenderer mesa lib32-mesa intel-media-driver; do
+            if [[ "${BUILT[$pkg]}" == "true" ]]; then
+              # Replace or append the line for this pkg
+              grep -v "^${pkg}=" last_built_versions.txt > /tmp/lbv || true
+              echo "${pkg}=${LATEST[$pkg]}" >> /tmp/lbv
+              mv /tmp/lbv last_built_versions.txt
+            fi
+          done
+          # Sort for stability
+          sort -o last_built_versions.txt last_built_versions.txt
+          echo "=== last_built_versions.txt ==="
+          cat last_built_versions.txt
+
+      - name: Commit
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet last_built_versions.txt; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git add last_built_versions.txt
+          git commit -m "chore: record built versions [skip ci]"
+          git push
+
+      - name: Build summary
+        run: |
+          {
+            echo "### Build complete"
+            echo ""
+            echo "| Package | Built? | Tag |"
+            echo "|---------|--------|-----|"
+            echo "| virglrenderer       | ${{ needs.get-versions.outputs.build_virglrenderer }}      | ${{ needs.get-versions.outputs.virglrenderer_tag }} |"
+            echo "| mesa                | ${{ needs.get-versions.outputs.build_mesa }}               | ${{ needs.get-versions.outputs.mesa_tag }} |"
+            echo "| lib32-mesa          | ${{ needs.get-versions.outputs.build_lib32_mesa }}         | ${{ needs.get-versions.outputs.lib32_mesa_tag }} |"
+            echo "| intel-media-driver  | ${{ needs.get-versions.outputs.build_intel_media_driver }} | ${{ needs.get-versions.outputs.intel_media_driver_tag }} |"
+            echo ""
+            echo "- Host repo: [latest-host](https://github.com/cmspam/xe-virt-repo/releases/tag/latest-host)"
+            echo "- Guest repo: [latest-guest](https://github.com/cmspam/xe-virt-repo/releases/tag/latest-guest)"
+          } >> "$GITHUB_STEP_SUMMARY"

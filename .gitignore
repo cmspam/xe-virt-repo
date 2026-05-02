@@ -1,0 +1,9 @@
+build/
+build-*/
+pkgs/
+staging/
+*.pkg.tar.zst
+*.db.tar.gz
+*.files.tar.gz
+*.log
+.DS_Store
