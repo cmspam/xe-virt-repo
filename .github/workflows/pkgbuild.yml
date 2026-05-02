@@ -305,9 +305,21 @@ jobs:
               content = content.rstrip() + '\n' + append_block + '\n'
               print(f'Appended source/sums for patch at EOF ({", ".join(existing_sums)})')
 
-          # 3. Add patch command to prepare(). Use bash variable expansion in src_dir.
+          # 3. Add patch command to prepare(), unless the existing prepare() already
+          #    auto-applies every *.patch in source[] via a `for src in "${source[@]}"`
+          #    loop (mesa/lib32-mesa do this). In that case our patch is picked up by
+          #    the existing loop and re-applying would double-patch.
           patch_cmd = f'  patch -Np1 -d "{src_dir}" -i "../{patch_file}"'
-          if '\nprepare() {' in content:
+          existing_prepare = re.search(r'\nprepare\(\)\s*\{(.*?)\n\}', content, re.DOTALL)
+          auto_applies = False
+          if existing_prepare:
+              body = existing_prepare.group(1)
+              if re.search(r'for\s+\w+\s+in\s+"?\$\{source\[@\]\}"?', body) and re.search(r'patch\s+-N', body):
+                  auto_applies = True
+
+          if auto_applies:
+              print('Existing prepare() auto-applies source[] patches; skipping patch_cmd inject')
+          elif '\nprepare() {' in content:
               content = content.replace('\nprepare() {', '\nprepare() {\n' + patch_cmd, 1)
               print('Inserted patch into existing prepare()')
           else:
