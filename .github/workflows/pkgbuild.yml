@@ -427,12 +427,23 @@ jobs:
           echo "=== Built packages ==="
           ls -lh build/*.pkg.tar.zst
 
+      - name: Bundle packages into tarball
+        if: steps.gate.outputs.needed == 'true'
+        run: |
+          set -euo pipefail
+          # actions/upload-artifact rejects ':' in paths (Windows-path semantics).
+          # mesa et al. have epoch=1, so makepkg emits 'pkg-1:ver-rel-arch.pkg.tar.zst'.
+          # Tar everything up so the colons survive inside the archive.
+          cd build
+          tar -cf pkgs.tar *.pkg.tar.zst
+          ls -lh pkgs.tar
+
       - name: Upload package artifacts
         if: steps.gate.outputs.needed == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: pkgs-${{ matrix.name }}
-          path: build/*.pkg.tar.zst
+          path: build/pkgs.tar
           if-no-files-found: error
           retention-days: 7
 
@@ -452,8 +463,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: pkgs-virglrenderer
-          path: fresh
+          path: fresh-tars
           merge-multiple: true
+
+      - name: Extract package tarballs
+        run: |
+          set -euo pipefail
+          mkdir -p fresh
+          for t in fresh-tars/*.tar; do
+            [[ -f "$t" ]] && tar -xf "$t" -C fresh/
+          done
+          ls -1 fresh/
 
       - name: Stage existing release packages (if any)
         env:
@@ -552,15 +572,16 @@ jobs:
           path: fresh-all
           merge-multiple: false
 
-      - name: Collect guest-bucket artifacts
+      - name: Extract guest-bucket package tarballs
         run: |
           set -euo pipefail
           mkdir -p fresh
-          # Each artifact is a subdir like fresh-all/pkgs-mesa/*.pkg.tar.zst
-          for d in fresh-all/pkgs-mesa fresh-all/pkgs-lib32-mesa fresh-all/pkgs-intel-media-driver; do
-            if [[ -d "$d" ]]; then
-              cp -v "$d"/*.pkg.tar.zst fresh/ || true
-            fi
+          # Each artifact is a subdir like fresh-all/pkgs-mesa/pkgs.tar.
+          # Only host bucket has virglrenderer; everything else (mesa, lib32-mesa,
+          # intel-media-driver) belongs to the guest bucket.
+          for name in mesa lib32-mesa intel-media-driver; do
+            t="fresh-all/pkgs-${name}/pkgs.tar"
+            [[ -f "$t" ]] && tar -xf "$t" -C fresh/
           done
           echo "Fresh guest pkgs:"
           ls -1 fresh/ || echo "(none)"
