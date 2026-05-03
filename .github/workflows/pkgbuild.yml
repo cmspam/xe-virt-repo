@@ -412,6 +412,21 @@ jobs:
               echo "=== Build dependencies ==="
               pacman -S --noconfirm --needed base-devel sudo
 
+              echo "=== Force x86-64-v3 march flags ==="
+              # The cachyos-v3 image ships with native-arch defaults in places, and
+              # some PKGBUILDs add their own -march. Append explicit v3 flags so the
+              # last -march/-mtune wins (gcc/clang last-flag-wins semantics) and
+              # binaries are uniform x86-64-v3 regardless of upstream defaults.
+              {
+                echo
+                echo "# xe-virt-repo: enforce x86-64-v3 build target"
+                echo "CFLAGS+=\" -march=x86-64-v3 -mtune=generic\""
+                echo "CXXFLAGS+=\" -march=x86-64-v3 -mtune=generic\""
+                echo "RUSTFLAGS+=\" -C target-cpu=x86-64-v3\""
+              } >> /etc/makepkg.conf
+              echo "--- Effective CFLAGS line after override ---"
+              grep -E "^(CFLAGS|CXXFLAGS|RUSTFLAGS)" /etc/makepkg.conf || true
+
               echo "=== Build user ==="
               useradd -m builder || true
               echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
