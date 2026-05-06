@@ -34,6 +34,10 @@ jobs:
       mesa_tag:                  ${{ steps.tags.outputs.mesa_tag }}
       lib32_mesa_tag:            ${{ steps.tags.outputs.lib32_mesa_tag }}
       intel_media_driver_tag:    ${{ steps.tags.outputs.intel_media_driver_tag }}
+      virglrenderer_sde:         ${{ steps.tags.outputs.virglrenderer_sde }}
+      mesa_sde:                  ${{ steps.tags.outputs.mesa_sde }}
+      lib32_mesa_sde:            ${{ steps.tags.outputs.lib32_mesa_sde }}
+      intel_media_driver_sde:    ${{ steps.tags.outputs.intel_media_driver_sde }}
       build_virglrenderer:       ${{ steps.check.outputs.build_virglrenderer }}
       build_mesa:                ${{ steps.check.outputs.build_mesa }}
       build_lib32_mesa:          ${{ steps.check.outputs.build_lib32_mesa }}
@@ -48,13 +52,19 @@ jobs:
         id: tags
         run: |
           set -euo pipefail
+          # Capture per-package tag name AND committed_date.
+          # The committed_date becomes SOURCE_DATE_EPOCH downstream so
+          # rebuilds of the same upstream tag produce identical bytes.
           for pkg in virglrenderer mesa lib32-mesa intel-media-driver; do
             ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$pkg")
-            TAG=$(curl -sf "${ARCH_API}%2F${ENC}/repository/tags?order_by=updated&sort=desc&per_page=1" \
-              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['name']) if d else sys.exit(1)")
-            VAR=$(echo "$pkg" | tr '-' '_')_tag
-            echo "${VAR}=${TAG}" >> "$GITHUB_OUTPUT"
-            echo "$pkg: $TAG"
+            curl -sf "${ARCH_API}%2F${ENC}/repository/tags?order_by=updated&sort=desc&per_page=1" \
+              > /tmp/$pkg.json
+            TAG=$(python3 -c "import sys,json; d=json.load(open('/tmp/$pkg.json')); print(d[0]['name']) if d else sys.exit(1)")
+            SDE=$(python3 -c "import json,datetime as dt; d=json.load(open('/tmp/$pkg.json'))[0]['commit']['committed_date']; print(int(dt.datetime.fromisoformat(d.replace('Z','+00:00')).timestamp()))")
+            VAR=$(echo "$pkg" | tr '-' '_')
+            echo "${VAR}_tag=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "${VAR}_sde=${SDE}" >> "$GITHUB_OUTPUT"
+            echo "$pkg: $TAG (SDE=$SDE)"
           done
 
       - name: Force daily rebuild of every package
@@ -106,6 +116,7 @@ jobs:
             bucket: host
             build_var: build_virglrenderer
             tag_var:   virglrenderer_tag
+            sde_var:   virglrenderer_sde
           - name: mesa
             arch_pkg: mesa
             patch_file: mesa-01-xe-native-context-plus-iris-upload-fix.patch
@@ -117,6 +128,7 @@ jobs:
             bucket: guest
             build_var: build_mesa
             tag_var:   mesa_tag
+            sde_var:   mesa_sde
           - name: lib32-mesa
             arch_pkg: lib32-mesa
             patch_file: mesa-01-xe-native-context-plus-iris-upload-fix.patch
@@ -128,6 +140,7 @@ jobs:
             bucket: guest
             build_var: build_lib32_mesa
             tag_var:   lib32_mesa_tag
+            sde_var:   lib32_mesa_sde
           - name: intel-media-driver
             arch_pkg: intel-media-driver
             patch_file: intel-media-driver-xe-native-context.patch
@@ -139,6 +152,7 @@ jobs:
             bucket: guest
             build_var: build_intel_media_driver
             tag_var:   intel_media_driver_tag
+            sde_var:   intel_media_driver_sde
 
     steps:
       - name: Should we build this matrix entry?
@@ -388,8 +402,17 @@ jobs:
         if: steps.gate.outputs.needed == 'true'
         run: |
           set -euo pipefail
+          # SOURCE_DATE_EPOCH = upstream Arch tag commit timestamp for
+          # this specific package. Same upstream tag → same SDE →
+          # reproducible build (modulo cachyos-v3 toolchain drift).
+          PKG_SDE="${{ needs.get-versions.outputs[matrix.sde_var] }}"
+          echo "Build SOURCE_DATE_EPOCH=$PKG_SDE for ${{ matrix.name }}"
           docker run --rm \
             --privileged \
+            -e SOURCE_DATE_EPOCH="$PKG_SDE" \
+            -e KBUILD_BUILD_TIMESTAMP="@$PKG_SDE" \
+            -e KBUILD_BUILD_USER=cmspam \
+            -e KBUILD_BUILD_HOST=cmspam-build \
             -v "$PWD/build:/pkg" \
             "${DOCKER_IMAGE}" \
             bash -c '
@@ -406,20 +429,27 @@ jobs:
               echo "=== Build dependencies ==="
               pacman -S --noconfirm --needed base-devel sudo
 
-              echo "=== Force x86-64-v3 march flags ==="
-              # The cachyos-v3 image ships with native-arch defaults in places, and
-              # some PKGBUILDs add their own -march. Append explicit v3 flags so the
-              # last -march/-mtune wins (gcc/clang last-flag-wins semantics) and
-              # binaries are uniform x86-64-v3 regardless of upstream defaults.
+              echo "=== Force x86-64-v3 + reproducibility flags in makepkg.conf ==="
+              # v3 baseline: cachyos-v3 image has native-arch defaults
+              # in places, last -march wins so we append.
+              # Reproducibility:
+              #   -ffile-prefix-map: no /tmp/<pkg>/src paths in binaries
+              #   --remap-path-prefix: same for rustc
+              #   --build-id=sha1: deterministic linker IDs
+              #   PACKAGER pinned: removes makepkg metadata variance
               {
                 echo
-                echo "# xe-virt-repo: enforce x86-64-v3 build target"
+                echo "# xe-virt-repo: enforce x86-64-v3 build target + reproducibility"
                 echo "CFLAGS+=\" -march=x86-64-v3 -mtune=generic\""
                 echo "CXXFLAGS+=\" -march=x86-64-v3 -mtune=generic\""
-                echo "RUSTFLAGS+=\" -C target-cpu=x86-64-v3\""
+                echo "RUSTFLAGS+=\" -C target-cpu=x86-64-v3 --remap-path-prefix=/tmp=/build --remap-path-prefix=/home/builder=/build\""
+                echo "CFLAGS+=\" -ffile-prefix-map=/tmp=/build -ffile-prefix-map=/home/builder=/build\""
+                echo "CXXFLAGS+=\" -ffile-prefix-map=/tmp=/build -ffile-prefix-map=/home/builder=/build\""
+                echo "LDFLAGS+=\" -Wl,--build-id=sha1\""
+                echo "PACKAGER=\"cmspam <cmspam@localhost>\""
               } >> /etc/makepkg.conf
-              echo "--- Effective CFLAGS line after override ---"
-              grep -E "^(CFLAGS|CXXFLAGS|RUSTFLAGS)" /etc/makepkg.conf || true
+              echo "--- Effective flags ---"
+              grep -E "^(CFLAGS|CXXFLAGS|RUSTFLAGS|LDFLAGS|PACKAGER)" /etc/makepkg.conf || true
 
               echo "=== Build user ==="
               useradd -m builder || true
@@ -430,7 +460,8 @@ jobs:
               cd /pkg
               # --skipinteg because we set SKIP for the patch we vendored in.
               # makepkg refuses to run as root, so use builder.
-              sudo -u builder makepkg -sf --noconfirm --skippgpcheck
+              # sudo -E preserves env vars (SOURCE_DATE_EPOCH etc).
+              sudo -E -u builder makepkg -sf --noconfirm --skippgpcheck
             '
           echo ""
           echo "=== Built packages ==="
