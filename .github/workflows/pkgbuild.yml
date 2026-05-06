@@ -460,8 +460,10 @@ jobs:
               cd /pkg
               # --skipinteg because we set SKIP for the patch we vendored in.
               # makepkg refuses to run as root, so use builder.
-              # sudo -E preserves env vars (SOURCE_DATE_EPOCH etc).
-              sudo -E -u builder makepkg -sf --noconfirm --skippgpcheck
+              # sudo -E preserves env (SOURCE_DATE_EPOCH etc) but also
+              # inherits HOME=/root from the docker bash; -H sets HOME
+              # back to /home/builder so makepkg's caches are correct.
+              sudo -E -H -u builder makepkg -sf --noconfirm --skippgpcheck
             '
           echo ""
           echo "=== Built packages ==="
