@@ -2,8 +2,10 @@ name: Build and Publish xe-virt packages
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # 06:00 UTC
-    - cron: '0 18 * * *'  # 18:00 UTC
+    # Daily at 14:00 UTC — 4 hours before cache22's 18:00 image build,
+    # so cache22's pacman -S sees fresh v3-rebuilt mesa/virglrenderer/
+    # intel-media-driver against current Arch sonames.
+    - cron: '0 14 * * *'
   workflow_dispatch:
   push:
     branches: [main]
@@ -55,15 +57,16 @@ jobs:
             echo "$pkg: $TAG"
           done
 
-      - name: Diff against last_built_versions.txt
+      - name: Force daily rebuild of every package
         id: check
         run: |
           set -euo pipefail
-          touch last_built_versions.txt
-          ANY=false
-          ANY_HOST=false
-          ANY_GUEST=false
-          declare -A BUCKET=( [virglrenderer]=host [mesa]=guest [lib32-mesa]=guest [intel-media-driver]=guest )
+          # Force daily rebuild against current Arch state. Pre-built
+          # binaries on rolling Arch get stale as upstream library
+          # sonames bump (mesa, libdrm, libva, glibc, …). Rebuilding
+          # all four packages every day keeps everything linked against
+          # current libs even when the upstream Arch packaging tag
+          # hasn't moved. last_built_versions.txt is informational.
           declare -A LATEST=(
             [virglrenderer]='${{ steps.tags.outputs.virglrenderer_tag }}'
             [mesa]='${{ steps.tags.outputs.mesa_tag }}'
@@ -71,22 +74,13 @@ jobs:
             [intel-media-driver]='${{ steps.tags.outputs.intel_media_driver_tag }}'
           )
           for pkg in virglrenderer mesa lib32-mesa intel-media-driver; do
-            LAST=$(grep -E "^${pkg}=" last_built_versions.txt | head -1 | cut -d= -f2- || true)
-            CUR="${LATEST[$pkg]}"
             KEY=build_$(echo "$pkg" | tr '-' '_')
-            if [[ "$LAST" == "$CUR" && -n "$LAST" ]]; then
-              echo "${KEY}=false" >> "$GITHUB_OUTPUT"
-              echo "  $pkg: up-to-date ($CUR)"
-            else
-              echo "${KEY}=true" >> "$GITHUB_OUTPUT"
-              echo "  $pkg: NEEDS BUILD (last='$LAST', latest='$CUR')"
-              ANY=true
-              if [[ "${BUCKET[$pkg]}" == "host" ]]; then ANY_HOST=true; else ANY_GUEST=true; fi
-            fi
+            echo "${KEY}=true" >> "$GITHUB_OUTPUT"
+            echo "  $pkg: forced rebuild (latest='${LATEST[$pkg]}')"
           done
-          echo "anything=${ANY}"             >> "$GITHUB_OUTPUT"
-          echo "anything_host=${ANY_HOST}"   >> "$GITHUB_OUTPUT"
-          echo "anything_guest=${ANY_GUEST}" >> "$GITHUB_OUTPUT"
+          echo "anything=true"       >> "$GITHUB_OUTPUT"
+          echo "anything_host=true"  >> "$GITHUB_OUTPUT"
+          echo "anything_guest=true" >> "$GITHUB_OUTPUT"
 
   # -------------------------------------------------------------------------
   # 2. Build each package (matrix). Skips quickly if its needs_build is false.
