@@ -423,10 +423,8 @@ jobs:
                 echo "CXXFLAGS+=\" -ffile-prefix-map=/tmp=/build -ffile-prefix-map=/home/builder=/build\""
                 echo "LDFLAGS+=\" -Wl,--build-id=sha1\""
                 echo "PACKAGER=\"cmspam <cmspam@localhost>\""
+                echo "DLAGENTS=(\"https::/usr/bin/curl -qgb \\\"\\\" -fLC - -A makepkg-ci/1.0 --retry 3 --retry-delay 3 -o %o %u\" \"http::/usr/bin/curl -qgb \\\"\\\" -fLC - -A makepkg-ci/1.0 --retry 3 --retry-delay 3 -o %o %u\")"
               } >> /etc/makepkg.conf
-              cat >> /etc/makepkg.conf <<"DLAGENTS_EOF"
-DLAGENTS=("https::/usr/bin/curl -qgb \"\" -fLC - -A makepkg-ci/1.0 --retry 3 --retry-delay 3 -o %o %u" "http::/usr/bin/curl -qgb \"\" -fLC - -A makepkg-ci/1.0 --retry 3 --retry-delay 3 -o %o %u")
-DLAGENTS_EOF
               echo "--- Effective flags ---"
               grep -E "^(CFLAGS|CXXFLAGS|RUSTFLAGS|LDFLAGS|PACKAGER)" /etc/makepkg.conf || true
 
