@@ -411,6 +411,8 @@ jobs:
               #   --remap-path-prefix: same for rustc
               #   --build-id=sha1: deterministic linker IDs
               #   PACKAGER pinned: removes makepkg metadata variance
+              # DLAGENTS override: crates.io 403s the default curl UA per
+              # their data-access policy, so set a non-default -A.
               {
                 echo
                 echo "# xe-virt-repo: enforce x86-64-v3 build target + reproducibility"
@@ -422,6 +424,9 @@ jobs:
                 echo "LDFLAGS+=\" -Wl,--build-id=sha1\""
                 echo "PACKAGER=\"cmspam <cmspam@localhost>\""
               } >> /etc/makepkg.conf
+              cat >> /etc/makepkg.conf <<"DLAGENTS_EOF"
+DLAGENTS=("https::/usr/bin/curl -qgb \"\" -fLC - -A makepkg-ci/1.0 --retry 3 --retry-delay 3 -o %o %u" "http::/usr/bin/curl -qgb \"\" -fLC - -A makepkg-ci/1.0 --retry 3 --retry-delay 3 -o %o %u")
+DLAGENTS_EOF
               echo "--- Effective flags ---"
               grep -E "^(CFLAGS|CXXFLAGS|RUSTFLAGS|LDFLAGS|PACKAGER)" /etc/makepkg.conf || true
 
