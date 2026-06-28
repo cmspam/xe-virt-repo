@@ -42,6 +42,10 @@ jobs:
       build_mesa:                ${{ steps.check.outputs.build_mesa }}
       build_lib32_mesa:          ${{ steps.check.outputs.build_lib32_mesa }}
       build_intel_media_driver:  ${{ steps.check.outputs.build_intel_media_driver }}
+      fp_virglrenderer:          ${{ steps.check.outputs.fp_virglrenderer }}
+      fp_mesa:                   ${{ steps.check.outputs.fp_mesa }}
+      fp_lib32_mesa:             ${{ steps.check.outputs.fp_lib32_mesa }}
+      fp_intel_media_driver:     ${{ steps.check.outputs.fp_intel_media_driver }}
       anything_host:             ${{ steps.check.outputs.anything_host }}
       anything_guest:            ${{ steps.check.outputs.anything_guest }}
       anything:                  ${{ steps.check.outputs.anything }}
@@ -67,30 +71,61 @@ jobs:
             echo "$pkg: $TAG (SDE=$SDE)"
           done
 
-      - name: Force daily rebuild of every package
+      - name: Decide what needs building
         id: check
         run: |
           set -euo pipefail
-          # Force daily rebuild against current Arch state. Pre-built
-          # binaries on rolling Arch get stale as upstream library
-          # sonames bump (mesa, libdrm, libva, glibc, …). Rebuilding
-          # all four packages every day keeps everything linked against
-          # current libs even when the upstream Arch packaging tag
-          # hasn't moved. last_built_versions.txt is informational.
+          # Build a package only when an input that changes its output
+          # bytes moved: the upstream Arch packaging tag, or its xe
+          # native-context patch (fetched from xe-native-context-
+          # enablement). A floating cachyos-v3 toolchain (gcc/glibc bump)
+          # alone is NOT a reason to rebuild — the binary would differ
+          # byte-for-byte with no functional change, forcing every cache22
+          # consumer to redownload the layer. The per-package fingerprint
+          # pins both real inputs; manual dispatch forces all four.
           declare -A LATEST=(
             [virglrenderer]='${{ steps.tags.outputs.virglrenderer_tag }}'
             [mesa]='${{ steps.tags.outputs.mesa_tag }}'
             [lib32-mesa]='${{ steps.tags.outputs.lib32_mesa_tag }}'
             [intel-media-driver]='${{ steps.tags.outputs.intel_media_driver_tag }}'
           )
+          # Patch each package is built with. mesa and lib32-mesa share one.
+          declare -A PATCH=(
+            [virglrenderer]='virglrenderer-xe-native-context.patch'
+            [mesa]='mesa-01-xe-native-context-plus-iris-upload-fix.patch'
+            [lib32-mesa]='mesa-01-xe-native-context-plus-iris-upload-fix.patch'
+            [intel-media-driver]='intel-media-driver-xe-native-context.patch'
+          )
+          # host bucket = virglrenderer; guest bucket = the other three.
+          declare -A BUCKET=(
+            [virglrenderer]=host
+            [mesa]=guest
+            [lib32-mesa]=guest
+            [intel-media-driver]=guest
+          )
+          force=false
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && force=true
+          touch last_built_versions.txt
+          anything=false; anything_host=false; anything_guest=false
           for pkg in virglrenderer mesa lib32-mesa intel-media-driver; do
-            KEY=build_$(echo "$pkg" | tr '-' '_')
-            echo "${KEY}=true" >> "$GITHUB_OUTPUT"
-            echo "  $pkg: forced rebuild (latest='${LATEST[$pkg]}')"
+            VAR=$(echo "$pkg" | tr '-' '_')
+            phash=$(curl -fsSL "${PATCH_BASE}/${PATCH[$pkg]}" | sha256sum | cut -c1-12)
+            fp="${LATEST[$pkg]}+p${phash}"
+            last=$(grep "^${pkg}=" last_built_versions.txt | head -1 | cut -d= -f2- || true)
+            echo "fp_${VAR}=${fp}" >> "$GITHUB_OUTPUT"
+            if [ "$force" = true ] || [ "$fp" != "$last" ]; then
+              echo "build_${VAR}=true" >> "$GITHUB_OUTPUT"
+              anything=true
+              if [ "${BUCKET[$pkg]}" = host ]; then anything_host=true; else anything_guest=true; fi
+              echo "  $pkg: BUILD ('${last}' -> '${fp}')"
+            else
+              echo "build_${VAR}=false" >> "$GITHUB_OUTPUT"
+              echo "  $pkg: skip (up to date: '${fp}')"
+            fi
           done
-          echo "anything=true"       >> "$GITHUB_OUTPUT"
-          echo "anything_host=true"  >> "$GITHUB_OUTPUT"
-          echo "anything_guest=true" >> "$GITHUB_OUTPUT"
+          echo "anything=${anything}"             >> "$GITHUB_OUTPUT"
+          echo "anything_host=${anything_host}"   >> "$GITHUB_OUTPUT"
+          echo "anything_guest=${anything_guest}" >> "$GITHUB_OUTPUT"
 
   # -------------------------------------------------------------------------
   # 2. Build each package (matrix). Skips quickly if its needs_build is false.
@@ -771,11 +806,14 @@ jobs:
       - name: Update last_built_versions.txt
         run: |
           set -euo pipefail
-          declare -A LATEST=(
-            [virglrenderer]='${{ needs.get-versions.outputs.virglrenderer_tag }}'
-            [mesa]='${{ needs.get-versions.outputs.mesa_tag }}'
-            [lib32-mesa]='${{ needs.get-versions.outputs.lib32_mesa_tag }}'
-            [intel-media-driver]='${{ needs.get-versions.outputs.intel_media_driver_tag }}'
+          # Record the per-package fingerprint (tag + patch hash) that the
+          # gate compares against, not the bare tag — otherwise a patch-only
+          # change would never settle and would rebuild every run.
+          declare -A FP=(
+            [virglrenderer]='${{ needs.get-versions.outputs.fp_virglrenderer }}'
+            [mesa]='${{ needs.get-versions.outputs.fp_mesa }}'
+            [lib32-mesa]='${{ needs.get-versions.outputs.fp_lib32_mesa }}'
+            [intel-media-driver]='${{ needs.get-versions.outputs.fp_intel_media_driver }}'
           )
           declare -A BUILT=(
             [virglrenderer]='${{ needs.get-versions.outputs.build_virglrenderer }}'
@@ -788,7 +826,7 @@ jobs:
             if [[ "${BUILT[$pkg]}" == "true" ]]; then
               # Replace or append the line for this pkg
               grep -v "^${pkg}=" last_built_versions.txt > /tmp/lbv || true
-              echo "${pkg}=${LATEST[$pkg]}" >> /tmp/lbv
+              echo "${pkg}=${FP[$pkg]}" >> /tmp/lbv
               mv /tmp/lbv last_built_versions.txt
             fi
           done
