@@ -478,7 +478,25 @@ jobs:
               # the correct dir. (Avoid apostrophes in this comment —
               # the outer bash -c uses single-quotes, so an apostrophe
               # here would terminate the script early.)
-              sudo -E -H -u builder makepkg -sf --noconfirm --skippgpcheck
+              #
+              # Retried: makepkg -s resolves build deps through pacman, and a
+              # CachyOS mirror serving a 404 or a 522 for one package fails the
+              # whole job. Resync the databases between attempts so a mirror
+              # that was mid-sync gets picked up. A real build error fails all
+              # five attempts and still exits non-zero.
+              for attempt in 1 2 3 4 5; do
+                echo "=== makepkg attempt $attempt ==="
+                if sudo -E -H -u builder makepkg -sf --noconfirm --skippgpcheck; then
+                  break
+                fi
+                if [ "$attempt" = "5" ]; then
+                  echo "makepkg failed after 5 attempts" >&2
+                  exit 1
+                fi
+                echo "attempt $attempt failed; resyncing and retrying in 60s" >&2
+                sleep 60
+                pacman -Syy --noconfirm || true
+              done
             '
           echo ""
           echo "=== Built packages ==="
