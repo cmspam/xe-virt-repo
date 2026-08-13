@@ -432,6 +432,21 @@ jobs:
                 echo "Multilib enabled."
               fi
 
+              echo "=== Prefer a CachyOS mirror with a complete pool ==="
+              # cdn77 serves 404 for packages its pool has not synced yet, and
+              # us.cachyos.org answers 522. Those are mirrors 1 and 2 in the
+              # shipped list and pacman does not fall past them here, so one
+              # lagging pool fails the whole job no matter how often we retry.
+              # Put a mirror that carries the full pool first, drop the dead one.
+              for f in /etc/pacman.d/cachyos*mirrorlist*; do
+                [ -f "$f" ] || continue
+                suffix=$(grep -m1 -oE "Server = https?://[^/]+(/.*)" "$f" | sed -E "s|Server = https?://[^/]+||")
+                [ -n "$suffix" ] || continue
+                sed -i "/us\.cachyos\.org/d" "$f"
+                sed -i "1i Server = https://mirror.cachyos.org$suffix" "$f"
+                echo "$f -> $(head -1 "$f")"
+              done
+
               echo "=== System update ==="
               pacman -Syu --noconfirm
 
