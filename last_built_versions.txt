@@ -1,4 +1,4 @@
 intel-media-driver=26.2.4-1+p0a5fe235e4a1
-lib32-mesa=1-26.2.1-1+p6640c5afae07
-mesa=1-26.2.1-1+p6640c5afae07
+lib32-mesa=1-26.2.2-1+p6640c5afae07
+mesa=1-26.2.2-1+p6640c5afae07
 virglrenderer=1.3.0-2+p5324b72276ff
