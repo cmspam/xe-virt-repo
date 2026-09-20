@@ -73,6 +73,8 @@ jobs:
 
       - name: Decide what needs building
         id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           # Build a package only when an input that changes its output
@@ -103,6 +105,16 @@ jobs:
             [lib32-mesa]=guest
             [intel-media-driver]=guest
           )
+          # What each published repo release holds right now. A package that
+          # is absent there has to be rebuilt even when its fingerprint is
+          # unchanged: the publish jobs carry a skipped package forward by
+          # copying it out of the release, so a release that lost one has no
+          # other way back.
+          for bucket in host guest; do
+            gh release view "latest-${bucket}" --json assets -q '.assets[].name' \
+              > "/tmp/assets-${bucket}.txt" 2>/dev/null || : > "/tmp/assets-${bucket}.txt"
+            echo "latest-${bucket}: $(wc -l < "/tmp/assets-${bucket}.txt") assets published"
+          done
           force=false
           [ "${{ github.event_name }}" = "workflow_dispatch" ] && force=true
           touch last_built_versions.txt
@@ -113,11 +125,19 @@ jobs:
             fp="${LATEST[$pkg]}+p${phash}"
             last=$(grep "^${pkg}=" last_built_versions.txt | head -1 | cut -d= -f2- || true)
             echo "fp_${VAR}=${fp}" >> "$GITHUB_OUTPUT"
-            if [ "$force" = true ] || [ "$fp" != "$last" ]; then
+            # A pkgname is followed by its version, so '^<pkg>-[0-9]' matches
+            # the package itself and not a subpackage such as mesa-docs.
+            published=true
+            grep -qE "^${pkg}-[0-9]" "/tmp/assets-${BUCKET[$pkg]}.txt" || published=false
+            if [ "$force" = true ] || [ "$fp" != "$last" ] || [ "$published" = false ]; then
               echo "build_${VAR}=true" >> "$GITHUB_OUTPUT"
               anything=true
               if [ "${BUCKET[$pkg]}" = host ]; then anything_host=true; else anything_guest=true; fi
-              echo "  $pkg: BUILD ('${last}' -> '${fp}')"
+              if [ "$published" = false ]; then
+                echo "  $pkg: BUILD (absent from latest-${BUCKET[$pkg]})"
+              else
+                echo "  $pkg: BUILD ('${last}' -> '${fp}')"
+              fi
             else
               echo "build_${VAR}=false" >> "$GITHUB_OUTPUT"
               echo "  $pkg: skip (up to date: '${fp}')"
@@ -635,14 +655,28 @@ jobs:
             echo "${KEY}=${ver}" >> "$GITHUB_ENV"
           done < versions.txt
 
-      - name: Replace latest-host release
+      - name: Verify the host bucket is complete
+        run: |
+          set -euo pipefail
+          # Every package of this bucket must be in staging before the release
+          # is touched. Publishing a subset would drop the missing ones from
+          # the repo, and they are only recoverable by a full rebuild.
+          missing=()
+          for p in virglrenderer; do
+            compgen -G "staging/${p}-[0-9]*-x86_64.pkg.tar.zst" > /dev/null || missing+=("$p")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::staging is missing ${missing[*]}; refusing to publish a partial repo."
+            exit 1
+          fi
+          echo "All host packages present."
+
+      - name: Publish latest-host release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           VTAG='${{ needs.get-versions.outputs.virglrenderer_tag }}'
-          gh release delete latest-host --yes --cleanup-tag 2>/dev/null || true
-
           NOTES=$(cat <<EOF
           Pacman repository for **host-side** Intel Xe native-context packages, built x86-64-v3.
 
@@ -658,7 +692,7 @@ jobs:
 
           ## Contents
 
-          - \`virglrenderer\` \`${VIRGLRENDERER_VER}\` (tracking Arch packaging tag \`${VTAG}\`)
+          - \`virglrenderer\` \`${VIRGLRENDERER_VER:-unknown}\` (tracking Arch packaging tag \`${VTAG}\`)
               + patch: [virglrenderer-xe-native-context.patch](https://github.com/cmspam/xe-native-context-enablement/blob/master/virglrenderer-xe-native-context.patch)
               + meson: \`-Ddrm-renderers=xe-experimental\`
 
@@ -666,14 +700,45 @@ jobs:
           EOF
           )
 
-          gh release create latest-host \
-            --title "xe-virt host repo (v3) - virglrenderer ${VIRGLRENDERER_VER}" \
-            --notes "$NOTES" \
-            staging/*.pkg.tar.zst \
-            staging/${REPO_NAME_HOST}.db.tar.gz \
-            staging/${REPO_NAME_HOST}.db \
-            staging/${REPO_NAME_HOST}.files.tar.gz \
-            staging/${REPO_NAME_HOST}.files
+          # The release is updated in place. Deleting it first would mean a
+          # failed upload leaves users with no repo at all, and the packages
+          # carried forward from it are then unrecoverable.
+          if gh release view latest-host > /dev/null 2>&1; then
+            gh release edit latest-host --title "xe-virt host repo (v3) - virglrenderer ${VIRGLRENDERER_VER:-unknown}" --notes "$NOTES"
+          else
+            gh release create latest-host --title "xe-virt host repo (v3) - virglrenderer ${VIRGLRENDERER_VER:-unknown}" --notes "$NOTES"
+          fi
+
+          # Asset uploads return a transient 422 or 500 often enough to matter
+          # at this asset count. --clobber makes the retry idempotent.
+          upload() {
+            for attempt in 1 2 3; do
+              if gh release upload latest-host --clobber "$@"; then
+                return 0
+              fi
+              echo "Upload attempt ${attempt} failed; retrying in 30s."
+              sleep 30
+            done
+            return 1
+          }
+
+          # Packages first and the database last, so a client syncing mid-run
+          # never sees a database indexing a package that is not there yet.
+          upload staging/*.pkg.tar.zst
+          upload staging/${REPO_NAME_HOST}.db.tar.gz \
+                 staging/${REPO_NAME_HOST}.db \
+                 staging/${REPO_NAME_HOST}.files.tar.gz \
+                 staging/${REPO_NAME_HOST}.files
+
+          # Drop assets this run superseded, so old versions do not accumulate.
+          ls staging > /tmp/keep-host.txt
+          gh release view latest-host --json assets -q '.assets[].name' \
+            | grep -vxF -f /tmp/keep-host.txt > /tmp/stale-host.txt || true
+          while read -r asset; do
+            [ -n "$asset" ] || continue
+            echo "Removing superseded asset ${asset}"
+            gh release delete-asset latest-host "$asset" --yes
+          done < /tmp/stale-host.txt
           echo "latest-host release published."
 
   # -------------------------------------------------------------------------
@@ -771,7 +836,23 @@ jobs:
             echo "${KEY}=${ver}" >> "$GITHUB_ENV"
           done < versions.txt
 
-      - name: Replace latest-guest release
+      - name: Verify the guest bucket is complete
+        run: |
+          set -euo pipefail
+          # Every package of this bucket must be in staging before the release
+          # is touched. Publishing a subset would drop the missing ones from
+          # the repo, and they are only recoverable by a full rebuild.
+          missing=()
+          for p in mesa lib32-mesa intel-media-driver; do
+            compgen -G "staging/${p}-[0-9]*-x86_64.pkg.tar.zst" > /dev/null || missing+=("$p")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::staging is missing ${missing[*]}; refusing to publish a partial repo."
+            exit 1
+          fi
+          echo "All guest packages present."
+
+      - name: Publish latest-guest release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -779,8 +860,6 @@ jobs:
           MTAG='${{ needs.get-versions.outputs.mesa_tag }}'
           LMTAG='${{ needs.get-versions.outputs.lib32_mesa_tag }}'
           IMD_TAG='${{ needs.get-versions.outputs.intel_media_driver_tag }}'
-          gh release delete latest-guest --yes --cleanup-tag 2>/dev/null || true
-
           NOTES=$(cat <<EOF
           Pacman repository for **guest-side** Intel Xe native-context packages, built x86-64-v3.
 
@@ -796,26 +875,57 @@ jobs:
 
           ## Contents
 
-          - \`mesa\` \`${MESA_VER}\` (tracking Arch packaging tag \`${MTAG}\`) plus split subpackages (\`vulkan-intel\`, \`opencl-clover-mesa\`, etc.)
+          - \`mesa\` \`${MESA_VER:-unknown}\` (tracking Arch packaging tag \`${MTAG}\`) plus split subpackages (\`vulkan-intel\`, \`opencl-clover-mesa\`, etc.)
               + patch: [mesa-01-xe-native-context-plus-iris-upload-fix.patch](https://github.com/cmspam/xe-native-context-enablement/blob/master/mesa-01-xe-native-context-plus-iris-upload-fix.patch)
               + meson: \`-D intel-virtio-experimental=true\`
-          - \`lib32-mesa\` \`${LIB32_MESA_VER}\` (tracking Arch packaging tag \`${LMTAG}\`) plus 32-bit split subpackages
+          - \`lib32-mesa\` \`${LIB32_MESA_VER:-unknown}\` (tracking Arch packaging tag \`${LMTAG}\`) plus 32-bit split subpackages
               + same patch and meson flag as \`mesa\`
-          - \`intel-media-driver\` \`${INTEL_MEDIA_DRIVER_VER}\` (tracking Arch packaging tag \`${IMD_TAG}\`)
+          - \`intel-media-driver\` \`${INTEL_MEDIA_DRIVER_VER:-unknown}\` (tracking Arch packaging tag \`${IMD_TAG}\`)
               + patch: [intel-media-driver-xe-native-context.patch](https://github.com/cmspam/xe-native-context-enablement/blob/master/intel-media-driver-xe-native-context.patch)
 
           Built in \`${DOCKER_IMAGE}\` (x86-64-v3).
           EOF
           )
 
-          gh release create latest-guest \
-            --title "xe-virt guest repo (v3) - mesa ${MESA_VER}" \
-            --notes "$NOTES" \
-            staging/*.pkg.tar.zst \
-            staging/${REPO_NAME_GUEST}.db.tar.gz \
-            staging/${REPO_NAME_GUEST}.db \
-            staging/${REPO_NAME_GUEST}.files.tar.gz \
-            staging/${REPO_NAME_GUEST}.files
+          # The release is updated in place. Deleting it first would mean a
+          # failed upload leaves users with no repo at all, and the packages
+          # carried forward from it are then unrecoverable.
+          if gh release view latest-guest > /dev/null 2>&1; then
+            gh release edit latest-guest --title "xe-virt guest repo (v3) - mesa ${MESA_VER:-unknown}" --notes "$NOTES"
+          else
+            gh release create latest-guest --title "xe-virt guest repo (v3) - mesa ${MESA_VER:-unknown}" --notes "$NOTES"
+          fi
+
+          # Asset uploads return a transient 422 or 500 often enough to matter
+          # at this asset count. --clobber makes the retry idempotent.
+          upload() {
+            for attempt in 1 2 3; do
+              if gh release upload latest-guest --clobber "$@"; then
+                return 0
+              fi
+              echo "Upload attempt ${attempt} failed; retrying in 30s."
+              sleep 30
+            done
+            return 1
+          }
+
+          # Packages first and the database last, so a client syncing mid-run
+          # never sees a database indexing a package that is not there yet.
+          upload staging/*.pkg.tar.zst
+          upload staging/${REPO_NAME_GUEST}.db.tar.gz \
+                 staging/${REPO_NAME_GUEST}.db \
+                 staging/${REPO_NAME_GUEST}.files.tar.gz \
+                 staging/${REPO_NAME_GUEST}.files
+
+          # Drop assets this run superseded, so old versions do not accumulate.
+          ls staging > /tmp/keep-guest.txt
+          gh release view latest-guest --json assets -q '.assets[].name' \
+            | grep -vxF -f /tmp/keep-guest.txt > /tmp/stale-guest.txt || true
+          while read -r asset; do
+            [ -n "$asset" ] || continue
+            echo "Removing superseded asset ${asset}"
+            gh release delete-asset latest-guest "$asset" --yes
+          done < /tmp/stale-guest.txt
           echo "latest-guest release published."
 
   # -------------------------------------------------------------------------
